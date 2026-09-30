@@ -270,6 +270,10 @@ def build_clim(lat, lon, today):
     keys = ["tx", "tn", "tm", "pr"]
     out = {"d": {k: [None] * 366 for k in ("txm", "txlo", "txhi", "tnm", "tnlo", "tnhi", "tmm", "prm", "f1", "f5", "f10", "f25")},
            "w": {k: [None] * 366 for k in ("tm", "t33", "t67", "pm", "f1", "f10", "f25")}, "made": today.strftime("%Y-%m-%d")}
+    try:
+        out["off"] = hourly_offsets(lat, lon, today)
+    except Exception as e:
+        print("! تعويض العينات", e); out["off"] = None
     for s in range(366):
         win = [(s + o) % 366 for o in range(-7, 8)]
         col = {i: [] for i in range(4)}
@@ -303,6 +307,33 @@ def build_clim(lat, lon, today):
             for t in (1, 10, 25):
                 out["w"]["f%d" % t][s] = sum(1 for x in prs if x >= t) / len(prs)
     return out
+
+
+def hourly_offsets(lat, lon, today):
+    """عيّنات 6 ساعات (06/12/18/24 UTC) تفوّت الصغرى الحقيقية وقد تفوّت العظمى: نقيس الفرق تاريخياً من ERA5 الساعي ونصحّح به."""
+    if DEMO:
+        return None
+    y1 = today.year - 1; y0 = y1 - 2
+    q = urllib.parse.urlencode({"latitude": lat, "longitude": lon, "start_date": f"{y0}-01-01", "end_date": f"{y1}-12-31",
+                                "hourly": "temperature_2m", "timezone": "GMT"})
+    h = get_json("https://archive-api.open-meteo.com/v1/archive?" + q, to=180).get("hourly", {})
+    days = {}
+    for t, v in zip(h.get("time", []), h.get("temperature_2m", [])):
+        if v is not None:
+            days.setdefault(t[:10], {})[int(t[11:13])] = v
+    acc = [[[], []] for _ in range(366)]
+    for ds, hs in days.items():
+        dt = datetime.strptime(ds, "%Y-%m-%d"); nx = days.get((dt + timedelta(days=1)).strftime("%Y-%m-%d"))
+        if len(hs) < 24 or not nx or 0 not in nx:
+            continue
+        sm = [hs[6], hs[12], hs[18], nx[0]]; i = doy(dt)
+        acc[i][0].append(max(hs.values()) - max(sm)); acc[i][1].append(min(hs.values()) - min(sm))
+    res = {"mx": [None] * 366, "mn": [None] * 366}
+    for s in range(366):
+        for j, k in enumerate(("mx", "mn")):
+            v = [x for o in range(-10, 11) for x in acc[(s + o) % 366][j]]
+            res[k][s] = round(mean(v), 2) if v else None
+    return res
 
 
 def cl(C, grp, key, dt):
@@ -382,6 +413,7 @@ def build_loc(PMs, C, WT, cal, T0, now):
     ls = lambda k: lead0 + (k + 1) / 4
     ld = lambda d: lead0 + d + .5
     dts = lambda d: T0 + timedelta(days=d)
+    oc = lambda kind, d: ((C.get("off") or {}).get(kind) or [0] * 366)[doy(dts(d))] or 0
     bias = cal.get("bias", {}); aR = cal["a_rain"]; aT = cal["a_temp"]
     out = {}
     # --- سلاسل 6 ساعات
@@ -389,6 +421,8 @@ def build_loc(PMs, C, WT, cal, T0, now):
     for var, key in [("temperature_2m", "temp"), ("wind_speed_10m", "wind"), ("wind_gusts_10m", "gust"),
                      ("cloud_cover", "cloud"), ("dew_point_2m", "dew"), ("pressure_msl", "pres")]:
         S = {m: pm[var] for m, pm in PMs.items() if var in pm}
+        if var == "temperature_2m":  # تصحيح الانحياز المتعلَّم
+            S = {m: [[None if x is None else x - bias.get(m, [0] * 6)[lbin(ls(k))] for k, x in enumerate(a)] for a in ar] for m, ar in S.items()}
         arrs = [[] for _ in QS]
         for k in range(N):
             vs, ws = gather(S, k, ls(k), WT); q = wq(vs, ws, QS)
@@ -418,8 +452,10 @@ def build_loc(PMs, C, WT, cal, T0, now):
         if "precipitation" in pm:
             e["rain"] = [daily_of(a, sum) for a in pm["precipitation"]]
         if "temperature_2m" in pm:
-            e["tmax"] = [daily_of(a, max) for a in pm["temperature_2m"]]
-            e["tmin"] = [daily_of(a, min) for a in pm["temperature_2m"]]
+            b0 = bias.get(m, [0] * 6)
+            fx = lambda a, kind, fn: [None if x is None else x - b0[lbin(ld(d))] + oc(kind, d) for d, x in enumerate(daily_of(a, fn))]
+            e["tmax"] = [fx(a, "mx", max) for a in pm["temperature_2m"]]
+            e["tmin"] = [fx(a, "mn", min) for a in pm["temperature_2m"]]
             raw = [daily_of(a, mean) for a in pm["temperature_2m"]]
             e["tmean_raw"] = raw
             b = bias.get(m, [0] * 6)
@@ -651,12 +687,12 @@ def learn(log, CL, now):
 
 # ---------------------------------------------------------------- الصفحة
 PAGE = r"""<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>أُفق — توقعات المدى الممتد</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#171a1f"><title>أُفق — توقعات المدى الممتد</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Readex+Pro:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--paper:#e9eff1;--card:#f7fafb;--ink:#13232f;--mut:#566a77;--grid:#c9d4da;--line:#9db0bb;--rain:#1c5fd1;--hot:#d9482b;--cold:#2b83c6;--wind:#0b8a78;--cloud:#66788a;--th:#7a2fc0;--dew:#2c9a8a;--pres:#5b52c8;--acc:#0f5a73}
-@media(prefers-color-scheme:dark){:root{--paper:#0e1b25;--card:#142633;--ink:#e1ebf1;--mut:#93a7b5;--grid:#243a49;--line:#39566a;--rain:#5b9bff;--hot:#ff7a5c;--cold:#5db4f0;--wind:#3fd0b8;--cloud:#9db0c2;--th:#b98cff;--dew:#5fd3c3;--pres:#9a92ff;--acc:#5fc2e0}}
+:root{--paper:#0e1b25;--card:#142633;--ink:#e1ebf1;--mut:#93a7b5;--grid:#243a49;--line:#39566a;--rain:#5b9bff;--hot:#ff7a5c;--cold:#5db4f0;--wind:#3fd0b8;--cloud:#9db0c2;--th:#b98cff;--dew:#5fd3c3;--pres:#9a92ff;--acc:#5fc2e0}
+@media(prefers-color-scheme:light){:root{--paper:#e9eff1;--card:#f7fafb;--ink:#13232f;--mut:#566a77;--grid:#c9d4da;--line:#9db0bb;--rain:#1c5fd1;--hot:#d9482b;--cold:#2b83c6;--wind:#0b8a78;--cloud:#66788a;--th:#7a2fc0;--dew:#2c9a8a;--pres:#5b52c8;--acc:#0f5a73}}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--paper);color:var(--ink);font:400 14px/1.7 "Readex Pro",Tahoma,sans-serif;font-variant-numeric:tabular-nums}
 main{max-width:1200px;margin:auto;padding:14px 12px 40px}
@@ -664,7 +700,7 @@ h1{font:600 30px/1.2 "Readex Pro",Tahoma,sans-serif;margin:4px 0 2px;letter-spac
 h2{font:600 16px/1.4 inherit;margin:0 0 8px}
 .sub{color:var(--mut);font-size:12.5px;margin:0 0 12px}
 .bar{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
-.bar button,.tabs button{font:inherit;font-size:13px;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 12px;cursor:pointer;min-height:36px}
+.bar button,.tabs button{-webkit-tap-highlight-color:transparent;font:inherit;font-size:13px;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 12px;cursor:pointer;min-height:36px}
 .bar button.on,.tabs button.on{background:var(--acc);color:var(--paper);border-color:var(--acc);font-weight:500}
 .tabs{display:flex;gap:6px;margin:10px 0;overflow-x:auto}
 .lay button{border-inline-start:5px solid var(--c);border-radius:4px 8px 8px 4px}
@@ -695,19 +731,34 @@ table{border-collapse:collapse;width:100%;font-size:12.5px;direction:rtl}th,td{p
 .tw{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:6px}
 footer{color:var(--mut);font-size:12px;line-height:1.9;margin-top:16px}
 .warn{background:color-mix(in srgb,var(--hot) 14%,var(--card));border:1px solid var(--hot);border-radius:8px;padding:6px 10px;font-size:12.5px;margin:8px 0}
+
+body{padding-bottom:calc(72px + env(safe-area-inset-bottom))}
+main{padding-top:calc(14px + env(safe-area-inset-top))}
+#locs{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}#locs button{white-space:nowrap;flex:none}
+.tabs{position:fixed;left:0;right:0;bottom:0;z-index:9;margin:0;gap:0;background:var(--card);border-top:1px solid var(--line);padding:4px 6px calc(4px + env(safe-area-inset-bottom))}
+.tabs button{flex:1;border:0;background:none;border-radius:8px;min-height:46px;font-size:12.5px;color:var(--mut)}
+.tabs button.on{background:none;color:var(--ink);box-shadow:inset 0 -3px 0 var(--acc)}
+#ro{top:env(safe-area-inset-top);font-size:12px;line-height:1.6;min-height:44px}
+.pt{width:max-content;max-width:calc(100vw - 64px);white-space:normal;line-height:1.5;padding-left:50px}
+.tl{fill:var(--ink);font-size:11px;font-weight:600;text-anchor:middle}.tl.lo{fill:var(--mut);font-weight:400}
+.cm{fill:none;stroke:var(--ink);stroke-width:1;stroke-dasharray:4 3;opacity:.55}
+.bar button{min-height:40px}
+@media(max-width:600px){h1{font-size:26px}main{padding-left:8px;padding-right:8px}.cards{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:no-preference){#sc{scroll-behavior:smooth}}
 </style></head><body><main>
 <h1>أُفق</h1><p class="sub" id="sub"></p>
 <div class="bar" id="locs"></div><div class="tabs" id="tabs"></div><div id="view"></div>
 <footer id="foot"></footer></main>
 <script>
-const DATA=__DATA__,M=DATA.meta,ND=M.D,NS=M.N,PW=26,SW=PW/4,T0=Date.parse(M.t0),LC='ar-IQ-u-nu-latn',TZ='Asia/Baghdad';
+const DATA=__DATA__,M=DATA.meta,ND=M.D,NS=M.N,T0=Date.parse(M.t0),LC='ar-IQ-u-nu-latn',TZ='Asia/Baghdad';
 const $=s=>document.querySelector(s),BUB=[2,5,9,15,25,46],bandOf=d=>{for(let i=0;i<6;i++)if(d+1<=BUB[i])return i;return 5};
 const fmt=(ms,o)=>new Date(ms).toLocaleString(LC,Object.assign({timeZone:TZ},o)),stepMs=k=>T0+(k+1)*6*36e5,dayMs=d=>T0+d*864e5+12*36e5;
 const f1=v=>v==null?'—':(+v).toFixed(1),f0=v=>v==null?'—':Math.round(v),iso=s=>Date.parse(s+'T12:00:00Z');
-const LAY=[['rain','الأمطار','--rain'],['prob','احتمال المطر','--rain'],['cum','المطر التراكمي','--rain'],['temp','الحرارة','--hot'],['wind','الرياح','--wind'],['cloud','الغيوم','--cloud'],['th','العواصف الرعدية','--th'],['dew','نقطة الندى','--dew'],['pres','الضغط','--pres']];
-let S={loc:Object.keys(DATA.locs)[0],view:'mg',thr:0,mv:'p1',lay:{rain:1,prob:1,cum:1,temp:1,wind:1,cloud:1,th:1,dew:0,pres:0}};
-try{const o=JSON.parse(localStorage.getItem('ofuq')||'{}');Object.assign(S,o);if(!DATA.locs[S.loc])S.loc=Object.keys(DATA.locs)[0]}catch(e){}
-const save=()=>{try{localStorage.setItem('ofuq',JSON.stringify(S))}catch(e){}};
+const LAY=[['temp','الحرارة','--hot'],['rain','الأمطار','--rain'],['cloud','الغيوم','--cloud'],['wind','الرياح','--wind'],['th','الرعد','--th'],['prob','احتمال المطر','--rain'],['cum','المطر التراكمي','--rain'],['dew','نقطة الندى','--dew'],['pres','الضغط','--pres']];
+let S={loc:Object.keys(DATA.locs)[0],view:'mg',thr:0,mv:'p1',z:15,lay:{temp:1,rain:1,cloud:1,wind:1,th:1,prob:0,cum:0,dew:0,pres:0}};
+let PW=26,SW=6.5;const setScale=()=>{const w=Math.min(document.documentElement.clientWidth,1200)-24-44;PW=Math.max(5.5,w/S.z);SW=PW/4};
+try{const o=JSON.parse(localStorage.getItem('ofuq2')||'{}');Object.assign(S,o);if(!DATA.locs[S.loc])S.loc=Object.keys(DATA.locs)[0]}catch(e){}
+const save=()=>{try{localStorage.setItem('ofuq2',JSON.stringify(S))}catch(e){}};
 const nice=m=>{if(!(m>0))return 1;const p=Math.pow(10,Math.floor(Math.log10(m))),f=m/p;return(f<=1?1:f<=2?2:f<=5?5:10)*p};
 const ticks=(a,b,n)=>{const st=nice((b-a)/n),o=[];for(let v=Math.ceil(a/st-1e-9)*st;v<=b+1e-9;v+=st)o.push(+v.toFixed(3));return o};
 const flat=a=>a.flat().filter(v=>v!=null),mx=(...a)=>Math.max(...flat(a)),mn=(...a)=>Math.min(...flat(a));
@@ -725,32 +776,40 @@ tk.forEach(t=>{g+=`<line x1="0" x2="${W}" y1="${y(t).toFixed(1)}" y2="${y(t).toF
 const lab=tk.map(t=>`<text x="40" y="${(y(t)+3).toFixed(1)}" class="yl">${t}</text>`).join('');
 return `<div class="pt" style="--c:var(${c})">${title} <small>${unit}</small></div><div class="prow" style="height:${h}px"><svg class="yax" width="44" height="${h}">${lab}</svg><svg class="plot" width="${W}" height="${h}">${bg}${g}${body(y,h)}</svg></div>`}
 function axis(L){const W=PW*ND;let t='',r='',s=0;
-for(let d=0;d<ND;d++){const n=fmt(dayMs(d),{day:'numeric'}),w=fmt(dayMs(d),{weekday:'narrow'}),first=fmt(dayMs(d),{day:'numeric'})=='1';
-t+=`<text x="${fxd(d)}" y="30">${w}</text><text x="${fxd(d)}" y="42" style="font-weight:600;fill:var(--ink)">${n}</text>`;if(first||d==0)t+=`<text x="${d*PW+2}" y="58" style="text-anchor:start;fill:var(--acc);font-weight:600">${fmt(dayMs(d),{month:'long'})}</text>`}
+const sk=PW>=16?1:PW>=9?2:7;for(let d=0;d<ND;d++){const n=fmt(dayMs(d),{day:'numeric'}),w=fmt(dayMs(d),{weekday:'narrow'}),first=fmt(dayMs(d),{day:'numeric'})=='1';
+if(d%sk==0)t+=`<text x="${fxd(d)}" y="30">${w}</text><text x="${fxd(d)}" y="42" style="font-weight:600;fill:var(--ink)">${n}</text>`;if(first||d==0)t+=`<text x="${d*PW+2}" y="58" style="text-anchor:start;fill:var(--acc);font-weight:600">${fmt(dayMs(d),{month:'long'})}</text>`}
 for(let d=1;d<=ND;d++)if(d==ND||bandOf(d)!=bandOf(s)){const b=bandOf(s),w=(d-s)*PW;r+=`<rect x="${s*PW}" y="2" width="${w}" height="18" fill="var(--acc)" fill-opacity="${(.12+.6*conf(b)/100).toFixed(2)}" stroke="var(--paper)"/><text class="rb" x="${s*PW+w/2}" y="15">${w>70?'ثقة '+conf(b)+'٪':''}</text>`;s=d}
 return `<div class="prow"><svg class="yax" width="44" height="62"><text x="40" y="15" class="yl">الثقة</text></svg><svg class="ax" width="${W}" height="62">${r}${t}</svg></div>`}
 function bars(arr,h,y,c,thr){return arr.map((v,d)=>v==null?'':`<rect x="${(d*PW+2).toFixed(1)}" y="${y(v).toFixed(1)}" width="${PW-4}" height="${(h-y(v)).toFixed(1)}" fill="var(${c})" fill-opacity="${(.25+.75*v/100).toFixed(2)}"/>`).join('')}
+const TCOL=['#0e5a35','#1f8f3a','#8cc63f','#e3ef4b','#ffd400','#ff9a00','#f0501e','#b3121a'],tc=t=>TCOL[Math.max(0,Math.min(7,Math.floor((t-2)/6)))];
+const ic=(d,i)=>{const p=d.p[0][i],c=d.cloud[2][i];return d.th[i]>=50&&d.ths[i]?'⛈️':p>=50?'🌧️':p>=25?'🌦️':c>=70?'☁️':c>=35?'⛅':'☀️'};
+const rh=(t,td)=>t==null||td==null?null:Math.min(100,100*Math.exp(17.625*td/(243.04+td)-17.625*t/(243.04+t)));
 function build(L){const s=L.s,d=L.d,c=d.c;let h='';
 const A=(k,fn)=>{if(S.lay[k])h+=fn()};
-A('rain',()=>{const top=nice(Math.max(mx(s.rain[3]),2));return panel('الأمطار — كل 6 ساعات (وسيط / 75٪ / 90٪ / 95٪)','--rain',150,0,top,'مم/6س',(y,H)=>[3,2,1,0].map((i,j)=>s.rain[i].map((v,k)=>v>.001?`<rect x="${(k*SW+.6).toFixed(1)}" y="${y(Math.min(v,top)).toFixed(1)}" width="${(SW-1.2).toFixed(1)}" height="${(H-y(Math.min(v,top))).toFixed(1)}" fill="var(--rain)" fill-opacity="${[.14,.28,.5,.9][j]}"/>`:'').join('')).join(''))});
+A('temp',()=>{const lo=Math.floor(mn(s.temp[0],c.tnm)-2),hi=Math.ceil(mx(s.temp[4],c.txm)+6);return panel('الحرارة على ارتفاع 2 م — الخط الأحمر الوسيط والظل نطاق 10–90٪','--hot',210,lo,hi,'°م',(y,H)=>{
+let st='';for(let t=hi;t>=lo;t--)st+=`<stop offset="${(y(t)/H*100).toFixed(1)}%" stop-color="${tc(t)}"/>`;
+const m=s.temp[2];let tx='';
+if(PW>=20)for(let i=0;i<ND;i++){const a=d.tmax[2][i],b=d.tmin[2][i];tx+=`<text x="${fxd(i)}" y="15" text-anchor="middle" font-size="14">${ic(d,i)}</text>`;if(a!=null)tx+=`<text x="${fxd(i)}" y="${(y(a)-6).toFixed(1)}" class="tl">${Math.round(a)}</text>`;if(b!=null)tx+=`<text x="${fxd(i)}" y="${(y(b)+14).toFixed(1)}" class="tl lo">${Math.round(b)}</text>`}
+return `<defs><linearGradient id="tg" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="${H}">${st}</linearGradient></defs><path d="${area(s.temp[0],s.temp[4],fxs,y)}" fill="url(#tg)" fill-opacity=".3"/><path d="${area(m.map(()=>lo),m,fxs,y)}" fill="url(#tg)" fill-opacity=".85"/><path d="${path(m,fxs,y)}" fill="none" stroke="#ff2d2d" stroke-width="2" stroke-linejoin="round"/><path d="${path(c.txm,fxd,y)}" class="cm"/><path d="${path(c.tnm,fxd,y)}" class="cm"/>${tx}`})});
+A('rain',()=>{const top=nice(Math.max(mx(s.rain[3]),2)),pr=d.p[S.thr],sc=v=>v==null?null:v*top/100;return panel('الأمطار — أعمدة 6 ساعات · بنفسجي: احتمال يوم ممطر · أزرق: رطوبة نسبية','--rain',160,0,top,'مم/6س',(y,H)=>[3,2,1,0].map((i,j)=>s.rain[i].map((v,k)=>v>.001?`<rect x="${(k*SW+.6).toFixed(1)}" y="${y(Math.min(v,top)).toFixed(1)}" width="${(SW-1.2).toFixed(1)}" height="${(H-y(Math.min(v,top))).toFixed(1)}" fill="var(--rain)" fill-opacity="${[.14,.28,.5,.9][j]}"/>`:'').join('')).join('')+`<path d="${path(pr.map(sc),fxd,y)}" fill="none" stroke="var(--th)" stroke-width="1.8"/><path d="${path(s.temp[2].map((t,k)=>sc(rh(t,s.dew[2][k]))),fxs,y)}" fill="none" stroke="var(--pres)" stroke-width="1.4"/>`)});
+A('cloud',()=>panel('الغيوم — كلما أغمق الرمادي زادت الغيوم','--cloud',40,0,100,'٪',(y,H)=>s.cloud[2].map((v,k)=>v==null?'':`<rect x="${(k*SW).toFixed(1)}" y="0" width="${(SW+.5).toFixed(1)}" height="${H}" fill="var(--ink)" fill-opacity="${(v/130).toFixed(2)}"/>`).join('')));
+A('wind',()=>{const top=nice(Math.max(mx(s.gust[3]),mx(s.wind[4]),20)*1.05);return panel('الرياح (نطاق السرعة) والهبّات (الخط المنقّط = وسيط الهبّات) وأعمدة احتمال هبّات ≥ 40','--wind',150,0,top,'كم/س',(y,H)=>fan(s.wind,fxs,y,'--wind')+`<path d="${path(s.gust[2],fxs,y)}" fill="none" stroke="var(--wind)" stroke-width="1.4" stroke-dasharray="2 3"/>`+d.gp[0].map((v,i)=>v==null?'':`<rect x="${(i*PW+8).toFixed(1)}" y="${(H-v*.25).toFixed(1)}" width="${PW-16}" height="${(v*.25).toFixed(1)}" fill="var(--wind)" fill-opacity=".5"/>`).join(''))});
+A('th',()=>panel('ميل العواصف الرعدية — خلايا مصمتة = مؤشر CAPE (حتى ~15 يوماً)، مخططة = مؤشر زخات فقط','--th',110,0,100,'٪',(y,H)=>`<defs><pattern id="hat" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="3" height="6" fill="var(--th)"/></pattern></defs>`+d.th.map((v,i)=>v==null?'':`<rect x="${(i*PW+2).toFixed(1)}" y="${y(v).toFixed(1)}" width="${PW-4}" height="${(H-y(v)).toFixed(1)}" fill="${d.ths[i]?'var(--th)':'url(#hat)'}" fill-opacity="${d.ths[i]?(.3+.7*v/100).toFixed(2):(.35+.5*v/100).toFixed(2)}"/>`).join('')));
 A('prob',()=>panel('احتمال يوم ممطر ≥ '+M.rain_t[S.thr]+' مم (الخط المتقطع = المناخ)','--rain',110,0,100,'٪',(y,H)=>bars(d.p[S.thr],H,y,'--rain')+`<path d="${path(c.f[S.thr],fxd,y)}" fill="none" stroke="var(--ink)" stroke-width="1.4" stroke-dasharray="4 3"/>`));
 A('cum',()=>{const top=nice(Math.max(mx(d.cum[2]),mx(c.cum),1));return panel('المطر التراكمي (10–90٪ والوسيط) مقابل المناخ','--rain',110,0,top,'مم',(y,H)=>`<path d="${area(d.cum[0],d.cum[2],fxd,y)}" fill="var(--rain)" fill-opacity=".22"/><path d="${path(d.cum[1],fxd,y)}" fill="none" stroke="var(--rain)" stroke-width="2"/><path d="${path(c.cum,fxd,y)}" fill="none" stroke="var(--ink)" stroke-width="1.4" stroke-dasharray="4 3"/>`)});
-A('temp',()=>{const lo=Math.floor(mn(s.temp[0],c.tnm)-2),hi=Math.ceil(mx(s.temp[4],c.txm)+2);return panel('الحرارة على ارتفاع 2 م (الخطان المتقطعان = معدل العظمى والصغرى المناخي)','--hot',190,lo,hi,'°م',(y)=>fan(s.temp,fxs,y,'--hot')+`<path d="${path(c.txm,fxd,y)}" fill="none" stroke="var(--ink)" stroke-width="1.3" stroke-dasharray="4 3"/><path d="${path(c.tnm,fxd,y)}" fill="none" stroke="var(--ink)" stroke-width="1.3" stroke-dasharray="4 3"/>`)});
-A('wind',()=>{const top=nice(Math.max(mx(s.gust[3]),mx(s.wind[4]),20)*1.05);return panel('الرياح (نطاق السرعة) والهبّات (الخط المنقّط = وسيط الهبّات) وأعمدة احتمال هبّات ≥ 40','--wind',150,0,top,'كم/س',(y,H)=>fan(s.wind,fxs,y,'--wind')+`<path d="${path(s.gust[2],fxs,y)}" fill="none" stroke="var(--wind)" stroke-width="1.4" stroke-dasharray="2 3"/>`+d.gp[0].map((v,i)=>v==null?'':`<rect x="${(i*PW+8).toFixed(1)}" y="${(H-v*.25).toFixed(1)}" width="${PW-16}" height="${(v*.25).toFixed(1)}" fill="var(--wind)" fill-opacity=".5"/>`).join(''))});
-A('cloud',()=>panel('الغطاء الغيمي','--cloud',110,0,100,'٪',y=>fan(s.cloud,fxs,y,'--cloud')));
-A('th',()=>panel('ميل العواصف الرعدية — خلايا مصمتة = مؤشر CAPE (حتى ~15 يوماً)، مخططة = مؤشر زخات فقط','--th',110,0,100,'٪',(y,H)=>`<defs><pattern id="hat" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="3" height="6" fill="var(--th)"/></pattern></defs>`+d.th.map((v,i)=>v==null?'':`<rect x="${(i*PW+2).toFixed(1)}" y="${y(v).toFixed(1)}" width="${PW-4}" height="${(H-y(v)).toFixed(1)}" fill="${d.ths[i]?'var(--th)':'url(#hat)'}" fill-opacity="${d.ths[i]?(.3+.7*v/100).toFixed(2):(.35+.5*v/100).toFixed(2)}"/>`).join('')));
 A('dew',()=>panel('نقطة الندى (مؤشر رطوبة الكتل الهوائية)','--dew',110,Math.floor(mn(s.dew[0])-1),Math.ceil(mx(s.dew[4])+1),'°م',y=>fan(s.dew,fxs,y,'--dew')));
 A('pres',()=>panel('الضغط عند سطح البحر','--pres',110,Math.floor(mn(s.pres[0])-1),Math.ceil(mx(s.pres[4])+1),'هكتوباسكال',y=>fan(s.pres,fxs,y,'--pres')));
 return h}
 function ro(L,k){const s=L.s,d=L.d,dy=Math.floor(k/4),q=a=>a[2][k];
 $('#ro').innerHTML=`<b>${fmt(stepMs(k),{weekday:'long',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})}</b><br>
 <span style="color:var(--hot)">حرارة ${f1(q(s.temp))}° (${f1(s.temp[0][k])}–${f1(s.temp[4][k])})</span><span style="color:var(--rain)">مطر/6س: وسيط ${f1(s.rain[0][k])} · 90٪ ${f1(s.rain[2][k])} مم</span><span style="color:var(--rain)">احتمال يوم ≥${M.rain_t[S.thr]} مم: ${f0(d.p[S.thr][dy])}٪ (مناخ ${f0(d.c.f[S.thr][dy])}٪)</span><span style="color:var(--wind)">رياح ${f0(q(s.wind))} · هبّات ${f0(s.gust[2][k])} كم/س</span><span style="color:var(--cloud)">غيوم ${f0(q(s.cloud))}٪</span><span style="color:var(--th)">رعد ${f0(d.th[dy])}٪${d.ths[dy]?'':' (مؤشر زخات)'}</span><span style="color:var(--dew)">ندى ${f1(q(s.dew))}°</span><span style="color:var(--pres)">ضغط ${f0(q(s.pres))}</span>`}
-function mgView(L){const b=LAY.map(([k,n,c])=>`<button data-l="${k}" class="${S.lay[k]?'on':''}" style="--c:var(${c})">${n}</button>`).join('');
+function mgView(L){setScale();const b=LAY.map(([k,n,c])=>`<button data-l="${k}" class="${S.lay[k]?'on':''}" style="--c:var(${c})">${n}</button>`).join('');
 const th=M.rain_t.map((t,i)=>`<button data-t="${i}" class="${S.thr==i?'on':''}">≥ ${t} مم</button>`).join('');
-return `<div class="bar lay">${b}</div><div class="bar"><span class="mut" style="align-self:center">عتبة المطر اليومي:</span>${th}</div>
-<div class="mut" style="margin:2px 0">الشريط الفاتح = 10–90٪ من الأعضاء، الداكن = 25–75٪، الخط = الوسيط. المدى مظلَّل تدريجياً كلما بعد، ونسبة «الثقة» في الأعلى تُقاس ذاتياً. المس أي نقطة لقراءة القيم.</div>
-<div id="ro">المس المخطط أو مرّر إصبعك لقراءة القيم.</div>
-<div id="sc"><div id="plots">${axis(L)}${build(L)}<div id="cur"></div></div></div>`}
+const z=[7,15,45].map(n=>`<button data-z="${n}" class="${S.z==n?'on':''}">${n} يوماً</button>`).join('');
+return `<div class="bar"><span class="mut" style="align-self:center">المعروض:</span>${z}</div><div class="bar lay">${b}</div><div class="bar"><span class="mut" style="align-self:center">عتبة المطر اليومي:</span>${th}</div>
+<div id="ro">المس المخطط لقراءة القيم، واسحب أفقياً للتنقل بين الأيام.</div>
+<div id="sc"><div id="plots">${axis(L)}${build(L)}<div id="cur"></div></div></div>
+<p class="mut" style="margin:6px 0">الظل الفاتح = 10–90٪ من الأعضاء والداكن = 25–75٪. تزداد عتمة الخلفية مع بُعد المدى، والنسبة أعلى الجدول هي ثقة النظام المقاسة ذاتياً.</p>`}
 function wkView(L){return `<div class="cards">`+L.wk.map(w=>{const b=bandOf(7*w.i+3),T=w.t,R=w.r,young=(M.cal.n_a[b]||0)<40;
 const tc=T&&T.terc?`<div class="terc"><i style="width:${T.terc[0]}%;background:var(--cold)">${f0(T.terc[0])}</i><i style="width:${T.terc[1]}%;background:var(--cloud)">${f0(T.terc[1])}</i><i style="width:${T.terc[2]}%;background:var(--hot)">${f0(T.terc[2])}</i></div><div class="mut" style="display:flex;justify-content:space-between;direction:ltr"><span>أبرد من المعتاد</span><span>قريب</span><span>أدفأ</span></div>`:'';
 const an=T&&T.clim!=null?T.m-T.clim:null;
@@ -787,10 +846,11 @@ const mv=e=>{const t=e.touches?e.touches[0]:e,r=pl.getBoundingClientRect(),k=Mat
 sc.addEventListener('pointermove',mv);sc.addEventListener('pointerdown',mv);}
 save()}
 document.addEventListener('click',e=>{const t=e.target.closest('button');if(!t)return;const d=t.dataset;
-if(d.k)S.loc=d.k;else if(d.v)S.view=d.v;else if(d.l)S.lay[d.l]=S.lay[d.l]?0:1;else if(d.t!=null)S.thr=+d.t;else if(d.m)S.mv=d.m;else return;
-const y=window.scrollY,sx=($('#sc')||{}).scrollLeft||0;render();window.scrollTo(0,y);if($('#sc'))$('#sc').scrollLeft=sx});
+if(d.k)S.loc=d.k;else if(d.v)S.view=d.v;else if(d.l)S.lay[d.l]=S.lay[d.l]?0:1;else if(d.t!=null)S.thr=+d.t;else if(d.m)S.mv=d.m;else if(d.z)S.z=+d.z;else return;
+const y=window.scrollY,sx=d.z?0:($('#sc')||{}).scrollLeft||0;render();window.scrollTo(0,y);if($('#sc'))$('#sc').scrollLeft=sx});
 $('#sub').textContent='آخر تحديث '+M.updated+' بتوقيت العراق · '+Object.keys(M.models).length+' أنظمة تنبؤ جماعي · ابتداءً من '+fmt(T0,{day:'numeric',month:'long'})+' لمدة '+ND+' يوماً';
 $('#foot').innerHTML='المصدر: بيانات ECMWF (EC46 وIFS وAIFS) وNOAA GFS وEnvironment Canada GEM عبر Open-Meteo، والتحقق بتحليل ERA5. بعد نحو 10–15 يوماً لا يوجد تنبؤ يومي موثوق: ما يُعرض من ذلك الحد هو ميل احتمالي (توزيع الأعضاء) قد يقارب المناخ، ولذلك تُقرَّب الاحتمالات من المناخ بمقدار «الثقة» المقاسة. الرعد بعد ~15 يوماً مؤشر زخات تقريبي وليس تنبؤاً بالبرق. القيم على شبكة 25–36 كم (لا تحل التفاصيل المحلية) والحرارة العظمى/الصغرى مستنتجة من عيّنات كل 6 ساعات. هذا عمل هواة وليس تحذيراً رسمياً.';
+let lw=innerWidth;addEventListener('resize',()=>{if(innerWidth!=lw){lw=innerWidth;render()}});
 render();
 </script></body></html>"""
 
@@ -822,7 +882,7 @@ def main():
     cp = os.path.join(a.state, "clim.json"); CL = jload(cp, {})
     def stale(k):
         try:
-            return (now.date() - datetime.strptime(CL[k]["made"], "%Y-%m-%d").date()).days > 60
+            return (now.date() - datetime.strptime(CL[k]["made"], "%Y-%m-%d").date()).days > 60 or "off" not in CL[k]
         except Exception:
             return True
     need = [k for k in LOCS if k not in CL or stale(k)]
