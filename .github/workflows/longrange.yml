@@ -1,0 +1,59 @@
+name: أفق — المدى الممتد
+on:
+  schedule:
+    - cron: "40 21 * * *"     # يومياً 21:40 UTC بعد صدور EC46
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: longrange
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: استرجاع الحالة (السجل والمناخ والمعايرة)
+        run: |
+          mkdir -p state
+          git fetch -q --depth=1 origin data && git archive FETCH_HEAD | tar -x -C state || echo "أول تشغيل"
+
+      - name: بناء الموقع
+        run: |
+          mkdir -p site
+          python longrange.py --state state --out site
+
+      - name: حفظ الحالة في فرع data
+        run: |
+          D=$(mktemp -d)
+          cp state/log.csv.gz state/clim.json state/calib.json "$D/"
+          cd "$D"
+          git init -q -b data
+          git config user.name ofuq-bot
+          git config user.email bot@users.noreply.github.com
+          git add .
+          git commit -qm "state"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.dep.outputs.page_url }}
+    steps:
+      - id: dep
+        uses: actions/deploy-pages@v4
